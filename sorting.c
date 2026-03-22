@@ -1,0 +1,249 @@
+#include "sorting.h"
+
+#include <assert.h>
+#include <omp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Comparison of doubles for use in qsort
+static int CompareDouble(const void* a, const void* b) {
+    const double da = *(const double*)a;
+    const double db = *(const double*)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
+
+static int PowerOfTwo(int x) {
+    return x > 0 && (x & (x - 1)) == 0;
+}
+
+// Initializes starting index and length of every group
+static void InitializeGroup(int n, int threads, int tid, int* start, int* len) {
+    const int base = n / threads;
+    const int rem = n % threads;
+    if (tid < rem) {
+        *len = base + 1;
+        *start = tid * (base + 1);
+    } else {
+        *len = base;
+        *start = rem * (base + 1) + (tid - rem) * base;
+    }
+}
+
+// Gets index of first element in list a larger than pivot
+static int GetSplit(const double* a, int n, double pivot) {
+    int lo = 0;
+    int hi = n;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (a[mid] < pivot) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static double PivotSelection(const double* a, int n) {
+    if (n <= 0) return 0.0;
+    if (n == 1) return a[0];
+
+    const double x = a[0];
+    const double y = a[n / 2];
+    const double z = a[n - 1];
+
+    if ((x <= y && y <= z) || (z <= y && y <= x)) return y;
+    if ((y <= x && x <= z) || (z <= x && x <= y)) return x;
+    return z;
+}
+
+static void RecursiveHelper(int start,
+                          int size,
+                          int n,
+                          double* src,
+                          double* dst,
+                          int* off,
+                          int* len,
+                          int* split,
+                          int* next_off,
+                          int* next_len,
+                          double* pivots) {
+    if (size <= 1) return;
+
+#pragma omp parallel num_threads(size)
+    {
+        const int locid = omp_get_thread_num();
+        const int team = omp_get_num_threads();
+        const int tid = start + locid;
+        const int half = size / 2;
+        const int localpartner = locid ^ half;
+        const int partner = start + localpartner;
+
+        if (team != size) {
+            #pragma omp single
+            {
+                fprintf(stderr,
+                        "OpenMP team-size mismatch: requested=%d actual=%d start=%d\n",
+                        size, team, start);
+            }
+            abort();
+        }
+
+        if (locid == 0) {
+            if (len[tid] > 0) pivots[start] = PivotSelection(src + off[tid], len[tid]);
+            else pivots[start] = 0.0;
+        }
+
+#pragma omp barrier
+        split[tid] = GetSplit(src + off[tid], len[tid], pivots[start]);
+
+#pragma omp barrier
+        const int low = split[tid];
+        const int partnerLow = split[partner];
+        const int high = len[tid] - low;
+        const int partnerHigh = len[partner] - partnerLow;
+        const int keep = (locid < half);
+        next_len[tid] = keep ? (low + partnerLow) : (high + partnerHigh);
+
+#pragma omp barrier
+#pragma omp single
+        {
+            const int base = off[start];
+            next_off[start] = base;
+            for (int i = start + 1; i < start + size; i++) {
+                next_off[i] = next_off[i - 1] + next_len[i - 1];
+            }
+
+            const int last = start + size - 1;
+            if (next_off[last] + next_len[last] > n) {
+                fprintf(stderr,
+                        "Offset overflow: start=%d size=%d end=%d n=%d\n",
+                        start,
+                        size,
+                        next_off[last] + next_len[last],
+                        n);
+                abort();
+            }
+        }
+
+#pragma omp barrier
+        if (locid < localpartner) {
+            const int low_tid = tid;
+            const int high_tid = partner;
+
+            const double* low_seg = src + off[low_tid];
+            const double* high_seg = src + off[high_tid];
+
+            double* out_low = dst + next_off[low_tid];
+            double* out_high = dst + next_off[high_tid];
+
+            const int low_low_cnt = split[low_tid];
+            const int high_low_cnt = split[high_tid];
+
+            //Debug
+            assert(next_off[low_tid] >= 0 && next_off[low_tid] + next_len[low_tid] <= n);
+            assert(next_off[high_tid] >= 0 && next_off[high_tid] + next_len[high_tid] <= n);
+
+            //Merge logic
+            int i = 0, j = 0, k = 0;
+            while (i < low_low_cnt && j < high_low_cnt) {
+                if (low_seg[i] <= high_seg[j]) out_low[k++] = low_seg[i++];
+                else out_low[k++] = high_seg[j++];
+            }
+            while (i < low_low_cnt) out_low[k++] = low_seg[i++];
+            while (j < high_low_cnt) out_low[k++] = high_seg[j++];
+
+            i = low_low_cnt;
+            j = high_low_cnt;
+            k = 0;
+            while (i < len[low_tid] && j < len[high_tid]) {
+                if (low_seg[i] <= high_seg[j]) out_high[k++] = low_seg[i++];
+                else out_high[k++] = high_seg[j++];
+            }
+            while (i < len[low_tid]) out_high[k++] = low_seg[i++];
+            while (j < len[high_tid]) out_high[k++] = high_seg[j++];
+        }
+
+#pragma omp barrier
+        off[tid] = next_off[tid];
+        len[tid] = next_len[tid];
+    }
+
+    const int half = size / 2;
+#pragma omp parallel sections
+    {
+#pragma omp section
+    RecursiveHelper(start, half, n, dst, src, off, len, split, next_off, next_len, pivots);
+
+#pragma omp section
+    RecursiveHelper(start + half, half, n, dst, src, off, len, split, next_off, next_len, pivots);
+    }
+}
+
+// Checks if data is sorted
+int ValidateSorted(const double* data, int n) {
+    for (int i = 1; i < n; i++) {
+        if (data[i] < data[i - 1]) return 0;
+    }
+    return 1;
+}
+
+/*
+Parallel quicksort implementation for shared memory:
+1) Each thread owns a local sorted segment.
+2) For group sizes P, P/2, ..., 2:
+    - one pivot per group
+    - each thread splits local segment by pivot
+    - partner exchange: lower half keeps lows, upper half keeps highs
+    - local segment sizes are recomputed from exchanged counts
+ */
+int ParallelQuicksort(double* data, int n, int threads) {
+    if (!PowerOfTwo(threads)) {
+        fprintf(stderr, "threads must be power-of-two\n");
+        return 0;
+    }
+    if (n == 0) return 1;
+    if (threads == 1) {qsort(data, n, sizeof(double), CompareDouble); return 1;}
+    double* buf_a = data;
+    double* buf_b = (double*)malloc((size_t)n * sizeof(double));
+
+    int* off = (int*)calloc((size_t)threads, sizeof(int));
+    int* len = (int*)calloc((size_t)threads, sizeof(int));
+    int* next_off = (int*)calloc((size_t)threads, sizeof(int));
+    int* next_len = (int*)calloc((size_t)threads, sizeof(int));
+    int* split = (int*)calloc((size_t)threads, sizeof(int));
+    double* pivots = (double*)calloc((size_t)threads, sizeof(double));
+
+    if (!buf_b || !off || !len || !next_off || !next_len || !split || !pivots) {
+        free(buf_b);
+        free(off); free(len); free(next_off); free(next_len); free(split); free(pivots);
+        return 0;
+    }
+
+    for (int t = 0; t < threads; t++) {
+        InitializeGroup(n, threads, t, &off[t], &len[t]);
+    }
+
+    omp_set_dynamic(1);
+    omp_set_num_threads(threads);
+    omp_set_nested(1);
+
+#pragma omp parallel num_threads(threads)
+    {
+        const int tid = omp_get_thread_num();
+        qsort(buf_a + off[tid], (size_t)len[tid], sizeof(double), CompareDouble);
+    }
+
+    RecursiveHelper(0, threads, n, buf_a, buf_b, off, len, split, next_off, next_len, pivots);
+
+    int levels = 0;
+    for (int s = threads; s > 1; s /= 2) levels++;
+    double* final_buf = (levels % 2 == 0) ? buf_a : buf_b;
+    if (final_buf != data) {
+        memcpy(data, final_buf, (size_t)n * sizeof(double));
+    }
+
+    free(buf_b);
+    free(off); free(len); free(next_off); free(next_len); free(split); free(pivots);
+    return 1;
+}
