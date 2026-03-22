@@ -46,29 +46,16 @@ static int GetSplit(const double* a, int n, double pivot) {
 }
 
 static double PivotSelection(const double* a, int n) {
-    if (n <= 4) return 0.0;
+    if (n <= 0) return 0.0;
+    if (n == 1) return a[0];
 
-    const int last = n - 1;
-    const int i0 = 0;
-    const int i1 = last / 4;
-    const int i2 = last / 2;
-    const int i3 = (3 * last) / 4;
-    const int i4 = last;
+    const double x = a[0];
+    const double y = a[n / 2];
+    const double z = a[n - 1];
 
-    double v[5] = {a[i0], a[i1], a[i2], a[i3], a[i4]};
-
-    // Insertion sort
-    for (int i = 1; i < 5; i++) {
-        double key = v[i];
-        int j = i - 1;
-        while (j >= 0 && v[j] > key) {
-            v[j + 1] = v[j];
-            j--;
-        }
-        v[j + 1] = key;
-    }
-
-    return v[2];
+    if ((x <= y && y <= z) || (z <= y && y <= x)) return y;
+    if ((y <= x && x <= z) || (z <= x && x <= y)) return x;
+    return z;
 }
 
 static void RecursiveHelper(int start,
@@ -141,36 +128,42 @@ static void RecursiveHelper(int start,
         }
 
 #pragma omp barrier
-        
-        const int keep_low = keep;
-        const int low_tid = keep_low ? tid : partner;
-        const int high_tid = keep_low ? partner : tid;
+        if (locid < localpartner) {
+            const int low_tid = tid;
+            const int high_tid = partner;
 
-        const double* low_seg = src + off[low_tid];
-        const double* high_seg = src + off[high_tid];
-        double* out = dst + next_off[tid];
+            const double* low_seg = src + off[low_tid];
+            const double* high_seg = src + off[high_tid];
 
-        const int low_low_cnt = split[low_tid];
-        const int high_low_cnt = split[high_tid];
+            double* out_low = dst + next_off[low_tid];
+            double* out_high = dst + next_off[high_tid];
 
-        // Each thread merges one side and writes to output segment.
-        int i = keep_low ? 0 : low_low_cnt;
-        int j = keep_low ? 0 : high_low_cnt;
-        const int i_end = keep_low ? low_low_cnt : len[low_tid];
-        const int j_end = keep_low ? high_low_cnt : len[high_tid];
-        int k = 0;
+            const int low_low_cnt = split[low_tid];
+            const int high_low_cnt = split[high_tid];
 
-        assert(next_off[tid] >= 0 && next_off[tid] + next_len[tid] <= n);
+            //Debug
+            assert(next_off[low_tid] >= 0 && next_off[low_tid] + next_len[low_tid] <= n);
+            assert(next_off[high_tid] >= 0 && next_off[high_tid] + next_len[high_tid] <= n);
 
-        while (i < i_end && j < j_end) {
-            if (low_seg[i] <= high_seg[j]) out[k++] = low_seg[i++];
-            else out[k++] = high_seg[j++];
+            //Merge logic
+            int i = 0, j = 0, k = 0;
+            while (i < low_low_cnt && j < high_low_cnt) {
+                if (low_seg[i] <= high_seg[j]) out_low[k++] = low_seg[i++];
+                else out_low[k++] = high_seg[j++];
+            }
+            while (i < low_low_cnt) out_low[k++] = low_seg[i++];
+            while (j < high_low_cnt) out_low[k++] = high_seg[j++];
+
+            i = low_low_cnt;
+            j = high_low_cnt;
+            k = 0;
+            while (i < len[low_tid] && j < len[high_tid]) {
+                if (low_seg[i] <= high_seg[j]) out_high[k++] = low_seg[i++];
+                else out_high[k++] = high_seg[j++];
+            }
+            while (i < len[low_tid]) out_high[k++] = low_seg[i++];
+            while (j < len[high_tid]) out_high[k++] = high_seg[j++];
         }
-        while (i < i_end) out[k++] = low_seg[i++];
-        while (j < j_end) out[k++] = high_seg[j++];
-
-        assert(k == next_len[tid]);
-        
 
 #pragma omp barrier
         off[tid] = next_off[tid];

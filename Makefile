@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Ofast -march=native -std=c11 -Wall -Wextra -fopenmp
+CFLAGS = -Ofast -march=native -Wall -Wextra -fopenmp
 LDFLAGS = -fopenmp -lm
 
 TARGET = sort_program
